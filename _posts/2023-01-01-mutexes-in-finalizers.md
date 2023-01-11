@@ -5,7 +5,8 @@ date:   2023-01-01 00:00:00 +0000
 tags: ruby mongodb
 ---
 
-Ruby allows a developer to specify a *finalizer* proc for an object. This proc is called after an object was destroyed. This is a very useful mechanism that can be used for some cleanup when the object is gone. However, it turned out that there are limitations to what you can do inside finalizers. These limitations are similar to ones for a signal trap.
+Ruby allows a developer to specify a *finalizer* proc for an object. This proc is called after an object was destroyed. This is a very useful mechanism that can be used for some cleanup when the object is gone. However, it turned out that there are limitations to what you can do inside finalizers. And these limitations are the same as ones for a signal trap. So, if you write a finalizer,
+you should follow [the documentation for signal traps](https://github.com/ruby/ruby/blob/master/doc/signals.rdoc).
 
 Some time ago a user  opened [an issue](https://jira.mongodb.org/browse/RUBY-2869) in our bug tracker. In his logs he noticed an exception raised by the MongoDB Ruby driver:
 
@@ -137,9 +138,14 @@ end
 [reaper_thread, populator_thread].map(&:join)
 ```
 
-Yes, this code actually reproduces the problem, and the exception is raised! So, it looks like finalizers are executed inside a signal trap. Therefore, to fix the problem we should just follow the documentation and not use operations that are not allowed inside the traps. In our case with the cursor reaper, we got rid of mutexes in finalizers by using a queue data structure.
+Yes, this code actually reproduces the problem, and the exception is raised! So, it looks like finalizers are executed inside a signal trap. Therefore, to fix the problem we should just follow [the documentation](https://github.com/ruby/ruby/blob/master/doc/signals.rdoc) and not use operations that are not allowed inside the traps. In our case with the cursor reaper, we got rid of mutexes in finalizers by using a queue data structure, and the bug was fixed.
 
-We could actually stop here. But I decided to dig a bit deeper and find out why finalizers are executed inside a signal trap.
+## We Need to Go Deeper
+
+Even though the problem was gone, I decided to find out whether finalizers are *really* executed inside a signal trap. I though maybe Ruby VM
+uses signals internally to trigger garbage collection. I could not find any mentions about such a usage of signals, so I had to read
+Ruby source code. It tuned out to be fun, and the outcome was very unexpected!
+
 I started by finding where the error _“can't be called from trap context”_ is raised. I found it in `do_mutex_lock` function inside `thread_sync.c` file:
 
 ```c
@@ -150,15 +156,17 @@ if (!FL_TEST_RAW(self, MUTEX_ALLOW_TRAP) &&
 }
 ```
 
-So, what is actually verified is whether the execution context has a `TRAP_INTERRUPT_MASK` flag set. This flag is set in three functions: `rb_postponed_job_flush` in `vm_trace.c`, `rb_threadptr_execute_interrupts` in `thread.c`, and `signal_exec` in `signal.c`. After some debugging, I found out that in our case the flag is set in the `rb_postponed_job_flush` function. Actually, this is also confirmed by this comment for the `rb_gc` function in `gc.h`:
+So, what is actually verified is whether the execution context has a `TRAP_INTERRUPT_MASK` flag set. This flag is set in three functions: `rb_postponed_job_flush` in `vm_trace.c`, `rb_threadptr_execute_interrupts` in `thread.c`, and `signal_exec` in `signal.c`. After some debugging, I found out that in our case the flag is set in the `rb_postponed_job_flush` function. Actually, this is also confirmed by this comment for the `rb_gc` function in [`gc.h`](https://github.com/ruby/ruby/blob/master/include/ruby/internal/intern/gc.h#L230):
 
 ```
 * Finalisers are deferred until we can handle interrupts. See * `rb_postponed_job_flush` in vm_trace.c.
 ```
 
-Alright, now it is more or less clear what is going on. Finalizers are not executed immediately after an object is “garbage collected”. Instead, a postponed job is created and scheduled. Such jobs are executed in the `rb_postponed_job_flush` function. This function sets the `TRAP_INTERRUPT_MASK` flag, which is later checked by `do_mutex_lock`. Hence the error. I even found the commit that introduces the current behavior, and a bug that was fixed by this commit.
+Alright, now it is more or less clear what is going on. Finalizers are not executed immediately after an object is “garbage collected”. Instead, a postponed job is created and scheduled. Such jobs are executed in the `rb_postponed_job_flush` function. This function sets the `TRAP_INTERRUPT_MASK` flag, which is later checked by `do_mutex_lock`. Hence the error. I even found [the commit](https://github.com/ruby/ruby/commit/05459d1a33db59c47e98e327c9f52808ebc76a3f) that introduces the current behavior, and [a bug](https://bugs.ruby-lang.org/issues/10595) that was fixed by this commit.
+It looks like the Ruby team wanted to make sure that finalizers are never interrupted by a signal;
+as a side effect, code inside finalizers is treated as code inside a signal trap.
 
-To summarize, finalizers are **not** executed inside a signal trap; however, Ruby applies the same restrictions to signal traps and finalizers. This is not documented anywhere; further, the exception raised is a bit misleading. Be careful!
+_To summarize, finalizers are **not** executed inside a signal trap; however, Ruby applies the same restrictions to signal traps and finalizers. This is not documented anywhere; further, the exception raised is a bit misleading. Be careful!_
 
 P.S. It is still unclear why we did not see the exception when we trigger
 the garbage collection manually. I wasn't able to find the answer; maybe this is
