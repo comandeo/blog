@@ -171,5 +171,3 @@ _To summarize, finalizers are **not** executed inside a signal trap; however, Ru
 P.S. It is still unclear why we did not see the exception when we trigger
 the garbage collection manually. I wasn't able to find the answer; maybe this is
 a topic for my next article.
-
-{% include comments.html %}
